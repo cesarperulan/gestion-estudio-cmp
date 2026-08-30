@@ -121,6 +121,58 @@ function extractBalance(row) {
   return null;
 }
 
+
+const SOS_DISCOVERY_PATHS = [
+  '/api-comunidad/cuenta-corriente/listado',
+  '/api-comunidad/cuentacorriente/listado',
+  '/api-comunidad/cuentaCorriente/listado',
+  '/api-comunidad/cliente/cuenta-corriente',
+  '/api-comunidad/cliente/cuentacorriente',
+  '/api-comunidad/cliente/saldos',
+  '/api-comunidad/cliente/saldo',
+  '/api-comunidad/cuentas-corrientes',
+  '/api-comunidad/cuentas-corrientes/listado',
+  '/api-comunidad/quien-me-debe',
+  '/api-comunidad/quienmedebe',
+  '/api-comunidad/deudores',
+  '/api-comunidad/deudores/listado',
+  '/api-comunidad/cobranzas/saldos',
+  '/api-comunidad/cobros/saldos'
+];
+
+function looksLikeReceivablesPayload(payload) {
+  const rows = rowsFromPayload(payload);
+  if (!rows.length) return false;
+  return rows.some(row => extractBalance(row) || Object.keys(row || {}).some(k => /saldo|deuda|pend|debe|cobrar|importe/i.test(k)));
+}
+
+async function discoverReceivablesEndpoint(cuitToken) {
+  const attempts = [];
+  for (const pathName of SOS_DISCOVERY_PATHS) {
+    const variants = [
+      pathName,
+      `${pathName}?cliente=true&registros=200&pagina=1`,
+      `${pathName}?registros=200&pagina=1`
+    ];
+    for (const rel of variants) {
+      try {
+        const response = await fetch(`${SOS_BASE_URL}${rel}`, { headers: bearer(cuitToken) });
+        const text = await response.text();
+        let payload = null;
+        try { payload = JSON.parse(text); } catch {}
+        const entry = { path: rel, status: response.status, contentType: response.headers.get('content-type') || '', preview: text.slice(0, 240) };
+        if (response.ok && payload && looksLikeReceivablesPayload(payload)) {
+          entry.match = true;
+          return { found: true, path: rel, payload, attempts: [...attempts, entry] };
+        }
+        attempts.push(entry);
+      } catch (error) {
+        attempts.push({ path: rel, status: 0, preview: error.message });
+      }
+    }
+  }
+  return { found: false, attempts };
+}
 function rowsFromPayload(payload) {
   if (Array.isArray(payload)) return payload;
   const candidates = [payload?.items, payload?.registros, payload?.clientes, payload?.data, payload?.resultados, payload?.content];
@@ -179,19 +231,65 @@ app.post('/api/sos/test-login', async (_req, res) => {
   }
 });
 
+
+app.get('/api/sos/descubrir-cuentas-corrientes', async (_req, res) => {
+  try {
+    const session = await getSosSession();
+    const result = await discoverReceivablesEndpoint(session.cuitToken);
+    if (!result.found) {
+      return res.status(404).json({
+        ok: false,
+        cuit: session.cuit,
+        error: 'No se encontró automáticamente un endpoint de cuentas corrientes entre las rutas de solo lectura probadas.',
+        attempts: result.attempts
+      });
+    }
+    const rows = rowsFromPayload(result.payload);
+    const summary = summarizeRows(rows);
+    const total = summary.items.reduce((acc, x) => acc + x.saldo, 0);
+    res.json({
+      ok: true,
+      cuit: session.cuit,
+      discoveredPath: result.path,
+      detectedBalanceField: summary.detectedField,
+      items: summary.items,
+      total,
+      attempts: result.attempts
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
 app.get('/api/sos/cuentas-a-cobrar', async (_req, res) => {
   try {
     const session = await getSosSession();
     const configured = await fetchReceivablesFromConfiguredEndpoint(session.cuitToken);
-    const sourceRows = configured ? configured.rows : await fetchAllClients(session.cuitToken);
+    let sourceRows;
+    let source = configured?.source || null;
+    let discoveredPath = null;
+
+    if (configured) {
+      sourceRows = configured.rows;
+    } else {
+      const discovered = await discoverReceivablesEndpoint(session.cuitToken);
+      if (discovered.found) {
+        sourceRows = rowsFromPayload(discovered.payload);
+        source = 'endpoint-auto-descubierto';
+        discoveredPath = discovered.path;
+      } else {
+        sourceRows = await fetchAllClients(session.cuitToken);
+        source = 'cliente-listado';
+      }
+    }
+
     const summary = summarizeRows(sourceRows);
 
-    if (!summary.detectedField && !configured) {
+    if (!summary.detectedField) {
       return res.status(424).json({
         ok: false,
         cuit: session.cuit,
-        error: 'La conexión con SOS y el CUIT funcionaron, pero el listado de clientes no expone un campo de saldo reconocible. Falta configurar SOS_RECEIVABLES_PATH con el endpoint específico de cuentas corrientes de la documentación SOS.',
-        diagnostic: { clientesLeidos: sourceRows.length, camposEjemplo: Object.keys(sourceRows[0] || {}).slice(0, 40) }
+        error: 'La conexión con SOS funciona, pero todavía no se identificó un campo de saldo de cuenta corriente.',
+        diagnostic: { source, discoveredPath, registrosLeidos: sourceRows.length, camposEjemplo: Object.keys(sourceRows[0] || {}).slice(0, 50) }
       });
     }
 
@@ -199,7 +297,8 @@ app.get('/api/sos/cuentas-a-cobrar', async (_req, res) => {
     res.json({
       ok: true,
       cuit: session.cuit,
-      source: configured?.source || 'cliente-listado',
+      source,
+      discoveredPath,
       detectedBalanceField: summary.detectedField,
       items: summary.items,
       total,
